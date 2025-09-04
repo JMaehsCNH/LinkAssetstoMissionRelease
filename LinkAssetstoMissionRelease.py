@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os, sys, json, time, re
 import requests
 
@@ -10,7 +11,7 @@ JIRA_EMAIL          = os.environ.get("JIRA_EMAIL")
 JIRA_API_TOKEN      = os.environ.get("JIRA_API_TOKEN")
 ASSETS_WORKSPACE_ID = os.environ.get("ASSETS_WORKSPACE_ID")
 JQL                 = os.environ.get("JQL") or (
-    'project = PREC AND issuetype in ("Mission/Release") AND status != "Validated (Complete)"'
+    'project = PREC AND issuetype = "Mission/Release" AND status != "Validated (Complete)"'
 )
 
 if not all([JIRA_EMAIL, JIRA_API_TOKEN, ASSETS_WORKSPACE_ID]):
@@ -27,83 +28,41 @@ def die(msg, r=None):
         print(msg, file=sys.stderr)
     sys.exit(1)
 
-# ---- Jira Search (enhanced JQL) ----
-def search_issues(jql, next_token=None, max_results=100):
-    """
-    Uses the new enhanced JQL endpoint with cursor pagination.
-    Docs: /rest/api/3/search/jql (GET) + nextPageToken
-    """
+# ---------- Enhanced JQL search with cursor pagination ----------
+def search_get(jql, next_token=None, fields=None, max_results=100):
     url = f"{JIRA_SITE}/rest/api/3/search/jql"
-    params = {
-        "jql": jql,
-        "maxResults": max_results,  # Jira may cap/ignore; still pass a sensible value
-        # You can also add "fields" here, but Atlassian recommends using 'fields' in a POST body;
-        # for simplicity we GET everything and read fields later per issue.
-    }
+    params = {"jql": jql, "maxResults": max_results}
+    if fields:
+        params["fields"] = ",".join(fields)
     if next_token:
         params["nextPageToken"] = next_token
+    return requests.get(url, headers=H, auth=AUTH, params=params)
 
-    r = requests.get(url, headers=H, auth=AUTH, params=params)
-    if r.status_code != 200:
-        die("Jira enhanced search failed", r)
-    return r.json()
+def search_post(jql, next_token=None, fields=None, max_results=100):
+    url = f"{JIRA_SITE}/rest/api/3/search/jql"
+    body = {"jql": jql, "maxResults": max_results}
+    if fields:
+        body["fields"] = fields
+    if next_token:
+        body["nextPageToken"] = next_token
+    return requests.post(url, headers=H, auth=AUTH, json=body)
 
-# ---- Main loop (cursor-based) ----
-total_scanned = 0
-next_token = None
+def enhanced_search(jql, wanted_fields):
+    next_token = None
+    while True:
+        r = search_get(jql, next_token=next_token, fields=wanted_fields)
+        if r.status_code in (404, 405, 410):
+            r = search_post(jql, next_token=next_token, fields=wanted_fields)
+        if r.status_code != 200:
+            die("Jira enhanced search failed", r)
+        page = r.json()
+        for issue in page.get("issues", []):
+            yield issue
+        next_token = page.get("nextPageToken")
+        if not next_token:
+            break
 
-while True:
-    page = search_issues(JQL, next_token=next_token, max_results=100)
-    issues = page.get("issues", [])
-
-    if not issues:
-        break
-
-    for issue in issues:
-        key   = issue["key"]
-        fields= issue.get("fields") or {}
-        proj  = fields.get("project", {}).get("key")
-        itype = fields.get("issuetype", {}).get("name")
-        status= fields.get("status", {}).get("name")
-
-        # Double-guard
-        if proj != "PREC" or itype not in ("Mission","Release") or status == "Validated (Complete)":
-            continue
-
-        desc = fields.get("description") or ""
-        pairs = extract_pairs(desc if isinstance(desc, str) else get_issue_desc(key))
-        if not pairs:
-            print(f"{key}: no asset tree detected; skipping")
-            continue
-
-        existing = list_remote_links(key)
-        for cat, nm in pairs:
-            obj = aql_lookup(cat, nm)
-            if not obj:
-                print(f"{key}: not found in Assets (schema 3) → {cat} / {nm}")
-                continue
-            oid = obj.get("id")
-            url_ = asset_url(oid)
-            title = f"{cat} - {nm}"
-
-            if (title, url_) in existing:
-                print(f"{key}: link already exists → {title}")
-                continue
-
-            create_remote_link(key, title, url_)
-            existing.add((title, url_))
-            print(f"{key}: linked {title}")
-
-        total_scanned += 1
-
-    # move the cursor forward; stop when no token is returned
-    next_token = page.get("nextPageToken")
-    if not next_token:
-        break
-
-print(f"Done. Issues scanned: {total_scanned}")
-
-
+# ---------- Issue helpers ----------
 def get_issue_desc(key):
     url = f"{JIRA_SITE}/rest/api/3/issue/{key}?fields=description"
     r = requests.get(url, headers=H, auth=AUTH)
@@ -132,6 +91,7 @@ def create_remote_link(key, title, url_):
     if r.status_code not in (200,201):
         die(f"Failed to create remote link for {key}", r)
 
+# ---------- Assets lookup (schema 3) ----------
 def aql_lookup(category, name):
     aql = (
         f'objectSchemaId = {OBJECT_SCHEMA_ID} '
@@ -149,6 +109,7 @@ def aql_lookup(category, name):
 def asset_url(object_id:int):
     return f"{JIRA_SITE}/jira/servicedesk/assets/objects/{object_id}"
 
+# ---------- Parse the bullet tree ----------
 bullet_re = re.compile(r"^(?:-|\*)\s+(?P<cat>.+?)\s*$")
 child_re  = re.compile(r"^\s{2,}(?:-|\*)\s+(?P<name>.+?)\s*$")
 
@@ -169,55 +130,48 @@ def extract_pairs(desc_text):
                 pairs.append((current_cat, nm))
     return pairs
 
+# ---------- Main ----------
 def main():
-    start = 0
+    wanted_fields = ["summary","description","issuetype","project","status"]
     total_scanned = 0
-    while True:
-        page = search_issues(JQL, start_at=start, max_results=50)
-        issues = page.get("issues", [])
-        if not issues:
-            break
 
-        for issue in issues:
-            key   = issue["key"]
-            fields= issue["fields"]
-            proj  = fields["project"]["key"]
-            itype = fields["issuetype"]["name"]
-            status= fields["status"]["name"]
+    for issue in enhanced_search(JQL, wanted_fields):
+        key    = issue["key"]
+        fields = issue.get("fields") or {}
+        proj   = fields.get("project", {}).get("key")
+        itype  = fields.get("issuetype", {}).get("name")
+        status = fields.get("status", {}).get("name")
 
-            if proj != "PREC" or itype not in ("Mission","Release") or status == "Validated (Complete)":
+        # Only PREC + exact type + not Validated (Complete)
+        if proj != "PREC" or itype != "Mission/Release" or status == "Validated (Complete)":
+            continue
+
+        desc = fields.get("description") or ""
+        pairs = extract_pairs(desc if isinstance(desc, str) else get_issue_desc(key))
+        if not pairs:
+            print(f"{key}: no asset tree detected; skipping")
+            continue
+
+        existing = list_remote_links(key)
+        for cat, nm in pairs:
+            obj = aql_lookup(cat, nm)
+            if not obj:
+                print(f"{key}: not found in Assets (schema 3) → {cat} / {nm}")
+                continue
+            oid = obj.get("id")
+            url_ = asset_url(oid)
+            title = f"{cat} - {nm}"
+
+            if (title, url_) in existing:
+                print(f"{key}: link already exists → {title}")
                 continue
 
-            desc = fields.get("description") or ""
-            pairs = extract_pairs(desc if isinstance(desc, str) else get_issue_desc(key))
-            if not pairs:
-                print(f"{key}: no asset tree detected; skipping")
-                continue
+            create_remote_link(key, title, url_)
+            existing.add((title, url_))
+            print(f"{key}: linked {title}")
 
-            existing = list_remote_links(key)
-            for cat, nm in pairs:
-                obj = aql_lookup(cat, nm)
-                if not obj:
-                    print(f"{key}: not found in Assets (schema 3) → {cat} / {nm}")
-                    continue
-                oid = obj.get("id")
-                url_ = asset_url(oid)
-                title = f"{cat} - {nm}"
-
-                if (title, url_) in existing:
-                    print(f"{key}: link already exists → {title}")
-                    continue
-
-                create_remote_link(key, title, url_)
-                existing.add((title, url_))
-                print(f"{key}: linked {title}")
-
-            total_scanned += 1
-            time.sleep(0.25)
-
-        start = page.get("startAt", 0) + page.get("maxResults", 0)
-        if start >= page.get("total", 0):
-            break
+        total_scanned += 1
+        time.sleep(0.2)
 
     print(f"Done. Issues scanned: {total_scanned}")
 
