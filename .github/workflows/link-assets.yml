@@ -1,42 +1,30 @@
-name: Link JSM Assets to Work Item
+name: PREC | Link Assets from Description
 
 on:
-  workflow_dispatch:
-    inputs:
-      issue_key:
-        description: "Jira issue key (e.g., PREC-123)"
-        required: true
-        type: string
-      selections_json:
-        description: >
-          JSON array of { "category": "...", "name": "..." } to link.
-          Example:
-          [
-            {"category":"Displays","name":"11100411"},
-            {"category":"PCM Devices","name":"217646000000000"},
-            {"category":"DeweSoft Computers","name":"DB22020784"},
-            {"category":"CSS Loggers","name":"000005"}
-          ]
-        required: true
-        type: string
+  workflow_dispatch: {}
+  schedule:
+    - cron: "16 3 * * *"  # daily at 03:16 UTC (adjust as needed)
 
 jobs:
-  link-assets:
+  scan-and-link:
     runs-on: ubuntu-latest
     env:
-      # --- Jira/Auth/Workspace (store these in GitHub Secrets) ---
-      JIRA_SITE: ${{ secrets.JIRA_SITE }}            # e.g. https://yourcompany.atlassian.net
+      # ---- FIXED BASE URL ----
+      JIRA_SITE: https://cnhpd.atlassian.net
+
+      # ---- REQUIRED SECRETS ----
       JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
       ASSETS_WORKSPACE_ID: ${{ secrets.ASSETS_WORKSPACE_ID }}
-      # --- Inputs ---
-      ISSUE_KEY: ${{ inputs.issue_key }}
-      SELECTIONS_JSON: ${{ inputs.selections_json }}
+
+      # ---- CONFIG ----
+      OBJECT_SCHEMA_ID: "3"   # PV Assets
+      JQL: >
+        project = PREC
+        AND issuetype in ("Mission","Release")
+        AND status != "Validated (Complete)"
 
     steps:
-      - name: Checkout (optional)
-        uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -45,107 +33,176 @@ jobs:
       - name: Install deps
         run: pip install requests
 
-      - name: Link assets & append tree
+      - name: Query PREC missions/releases and add asset web links
         run: |
           python - <<'PY'
-          import os, sys, json, requests
+          import os, sys, json, time, re
+          import requests
 
-          JIRA_SITE           = os.environ["JIRA_SITE"]
+          JIRA_SITE           = os.environ["JIRA_SITE"].rstrip("/")
           JIRA_EMAIL          = os.environ["JIRA_EMAIL"]
           JIRA_API_TOKEN      = os.environ["JIRA_API_TOKEN"]
           ASSETS_WORKSPACE_ID = os.environ["ASSETS_WORKSPACE_ID"]
-          ISSUE_KEY           = os.environ["ISSUE_KEY"]
-          SELECTIONS_JSON     = os.environ["SELECTIONS_JSON"]
-
-          try:
-              SELECTIONS = json.loads(SELECTIONS_JSON)
-              assert isinstance(SELECTIONS, list)
-          except Exception as e:
-              print("SELECTIONS_JSON must be a JSON array of {category,name} objects.", file=sys.stderr)
-              raise
+          OBJECT_SCHEMA_ID    = os.environ["OBJECT_SCHEMA_ID"]
+          JQL                 = os.environ["JQL"]
 
           AUTH = (JIRA_EMAIL, JIRA_API_TOKEN)
-          JSON_HEADERS = {"Accept":"application/json","Content-Type":"application/json"}
+          H    = {"Accept":"application/json","Content-Type":"application/json"}
 
-          def die(msg, resp=None):
-              if resp is not None:
-                  print(f"{msg} ({resp.status_code}): {resp.text}", file=sys.stderr)
+          def die(msg, r=None):
+              if r is not None:
+                  print(f"{msg} ({r.status_code}): {r.text}", file=sys.stderr)
               else:
                   print(msg, file=sys.stderr)
               sys.exit(1)
 
-          def assets_aql_search(category, name):
-              # Adjust attribute names if yours differ (e.g., "SN", "Serial")
-              aql = f'objectType = "{category}" AND (Name = "{name}" OR "Serial Number" = "{name}")'
+          # ---- Jira Search (paginate) ----
+          def search_issues(jql, start_at=0, max_results=50):
+              url = f"{JIRA_SITE}/rest/api/3/search"
+              payload = {
+                  "jql": jql,
+                  "startAt": start_at,
+                  "maxResults": max_results,
+                  "fields": ["summary","description","issuetype","project","status"]
+              }
+              r = requests.post(url, headers=H, auth=AUTH, json=payload)
+              if r.status_code != 200:
+                  die("Jira search failed", r)
+              return r.json()
+
+          # ---- Read/Update Description ----
+          def get_issue_desc(key):
+              url = f"{JIRA_SITE}/rest/api/3/issue/{key}?fields=description"
+              r = requests.get(url, headers=H, auth=AUTH)
+              if r.status_code != 200:
+                  die(f"Failed to read description for {key}", r)
+              return r.json().get("fields",{}).get("description") or ""
+
+          def set_issue_desc(key, text):
+              url = f"{JIRA_SITE}/rest/api/3/issue/{key}"
+              r = requests.put(url, headers=H, auth=AUTH, json={"fields":{"description": text}})
+              if r.status_code != 204:
+                  die(f"Failed to update description for {key}", r)
+
+          # ---- Remote Links (avoid duplicates) ----
+          def list_remote_links(key):
+              url = f"{JIRA_SITE}/rest/api/3/issue/{key}/remotelink"
+              r = requests.get(url, headers=H, auth=AUTH)
+              if r.status_code != 200:
+                  die(f"Failed to list remote links for {key}", r)
+              links = r.json() if isinstance(r.json(), list) else []
+              existing = set()
+              for l in links:
+                  obj = l.get("object",{})
+                  title = obj.get("title") or ""
+                  url   = obj.get("url") or ""
+                  if title and url:
+                      existing.add((title.strip(), url.strip()))
+              return existing
+
+          def create_remote_link(key, title, url_):
+              url = f"{JIRA_SITE}/rest/api/3/issue/{key}/remotelink"
+              r = requests.post(url, headers=H, auth=AUTH, json={"object":{"title": title, "url": url_}})
+              if r.status_code not in (200,201):
+                  die(f"Failed to create remote link for {key}", r)
+
+          # ---- Assets lookup (scoped to PV Assets schemaId=3) ----
+          def aql_lookup(category, name):
+              # Adjust attribute names if yours differ ("Name", "Serial Number", "SN", etc.)
+              aql = (
+                  f'objectSchemaId = {OBJECT_SCHEMA_ID} '
+                  f'AND objectType = "{category}" '
+                  f'AND (Name = "{name}" OR "Serial Number" = "{name}")'
+              )
               url = f"{JIRA_SITE}/jsm/assets/workspace/{ASSETS_WORKSPACE_ID}/v1/object/aql"
-              payload = {"qlQuery": aql, "page": 1, "resultPerPage": 2}
-              r = requests.post(url, headers=JSON_HEADERS, auth=AUTH, data=json.dumps(payload))
+              r = requests.post(url, headers=H, auth=AUTH, json={"qlQuery": aql, "page":1, "resultPerPage":2})
               if r.status_code != 200:
                   die("Assets AQL search failed", r)
               data = r.json() or {}
               objs = data.get("objectEntries") or []
               return objs[0] if objs else None
 
-          def build_asset_url(object_id):
-              # Copy an object URL from your site if this path differs
+          def asset_url(object_id:int):
+              # Verify once by opening an asset in your site; adjust path if needed.
               return f"{JIRA_SITE}/jira/servicedesk/assets/objects/{object_id}"
 
-          def create_remote_link(issue_key, link_url, title):
-              url = f"{JIRA_SITE}/rest/api/3/issue/{issue_key}/remotelink"
-              payload = {"object": {"title": title, "url": link_url}}
-              r = requests.post(url, headers=JSON_HEADERS, auth=AUTH, data=json.dumps(payload))
-              if r.status_code not in (200,201):
-                  die("Failed to create remote link", r)
+          # ---- Parse the bullet tree from Description ----
+          # Accepts blocks like:
+          # - Displays
+          #   - 11100411
+          # - CSS Loggers
+          #   - 000005
+          bullet_re = re.compile(r"^(?:-|\*)\s+(?P<cat>.+?)\s*$")
+          child_re  = re.compile(r"^\s{2,}(?:-|\*)\s+(?P<name>.+?)\s*$")
 
-          def get_issue_description(issue_key):
-              url = f"{JIRA_SITE}/rest/api/3/issue/{issue_key}?fields=description"
-              r = requests.get(url, headers=JSON_HEADERS, auth=AUTH)
-              if r.status_code != 200:
-                  die("Failed to read issue", r)
-              fields = r.json().get("fields", {})
-              return fields.get("description") or ""
+          def extract_pairs(desc_text):
+              pairs = []
+              current_cat = None
+              # Description may be Markdown string (Team-managed) or ADF (Company-managed).
+              text = desc_text if isinstance(desc_text, str) else ""
+              for raw in (text or "").splitlines():
+                  line = raw.rstrip()
+                  m1 = bullet_re.match(line)
+                  if m1:
+                      current_cat = m1.group("cat").strip()
+                      continue
+                  m2 = child_re.match(line)
+                  if m2 and current_cat:
+                      nm = m2.group("name").strip()
+                      if nm:
+                          pairs.append((current_cat, nm))
+              return pairs
 
-          def set_issue_description(issue_key, new_text):
-              url = f"{JIRA_SITE}/rest/api/3/issue/{issue_key}"
-              payload = {"fields": {"description": new_text}}
-              r = requests.put(url, headers=JSON_HEADERS, auth=AUTH, data=json.dumps(payload))
-              if r.status_code != 204:
-                  die("Failed to update description", r)
+          # ---- Main loop ----
+          start = 0
+          total_scanned = 0
+          while True:
+              page = search_issues(JQL, start_at=start, max_results=50)
+              issues = page.get("issues", [])
+              if not issues:
+                  break
 
-          def append_tree_section(original, items_by_category):
-              lines = ["", "## Assets", ""]
-              for cat, names in items_by_category.items():
-                  lines.append(f"- {cat}")
-                  for nm in names:
-                      lines.append(f"  - {nm}")
-              return (original or "") + "\n" + "\n".join(lines) + "\n"
+              for issue in issues:
+                  key   = issue["key"]
+                  fields= issue["fields"]
+                  proj  = fields["project"]["key"]
+                  itype = fields["issuetype"]["name"]
+                  status= fields["status"]["name"]
 
-          items_by_cat = {}
-          for sel in SELECTIONS:
-              cat = sel.get("category","").strip()
-              nm  = sel.get("name","").strip()
-              if not cat or not nm:
-                  print(f"Skip malformed selection: {sel}")
-                  continue
+                  # Double-guard
+                  if proj != "PREC" or itype not in ("Mission","Release") or status == "Validated (Complete)":
+                      continue
 
-              obj = assets_aql_search(cat, nm)
-              if not obj:
-                  print(f"Skip: No asset found for {cat} / {nm}")
-                  continue
+                  desc = fields.get("description") or ""
+                  pairs = extract_pairs(desc if isinstance(desc, str) else get_issue_desc(key))
+                  if not pairs:
+                      print(f"{key}: no asset tree detected; skipping")
+                      continue
 
-              object_id = obj.get("id")
-              title = f"{cat} - {nm}"
-              url = build_asset_url(object_id)
-              create_remote_link(ISSUE_KEY, url, title)
-              items_by_cat.setdefault(cat, []).append(nm)
-              print(f"Linked: {title} -> {url}")
+                  existing = list_remote_links(key)
+                  for cat, nm in pairs:
+                      obj = aql_lookup(cat, nm)
+                      if not obj:
+                          print(f"{key}: not found in Assets (schema 3) → {cat} / {nm}")
+                          continue
+                      oid = obj.get("id")
+                      url_ = asset_url(oid)
+                      title = f"{cat} - {nm}"
 
-          if items_by_cat:
-              current = get_issue_description(ISSUE_KEY)
-              updated = append_tree_section(current, items_by_cat)
-              set_issue_description(ISSUE_KEY, updated)
-              print("Description updated with Assets section.")
-          else:
-              print("No assets linked; description not changed.")
+                      if (title, url_) in existing:
+                          print(f"{key}: link already exists → {title}")
+                          continue
+
+                      create_remote_link(key, title, url_)
+                      existing.add((title, url_))
+                      print(f"{key}: linked {title}")
+
+                  total_scanned += 1
+                  time.sleep(0.25)  # gentle rate limiting
+
+              start = page.get("startAt", 0) + page.get("maxResults", 0)
+              if start >= page.get("total", 0):
+                  break
+
+          print(f"Done. Issues scanned: {total_scanned}")
           PY
-
