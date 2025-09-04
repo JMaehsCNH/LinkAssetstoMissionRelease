@@ -16,7 +16,7 @@ jobs:
       ASSETS_WORKSPACE_ID: ${{ secrets.ASSETS_WORKSPACE_ID }}
 
       # Config
-      OBJECT_SCHEMA_ID: "3"
+      OBJECT_SCHEMA_IDS: "3,23,18,32,20,31,21,30,26,16"
       # Broad JQL; we filter type in code
       JQL: >
         project = PREC AND statusCategory != Done
@@ -169,30 +169,25 @@ jobs:
       
           def aql_lookup(category, name):
               """
-              Safer staged search that only relies on Name (always present),
-              then falls back to fuzzy + objectType narrowing.
+              Search across multiple schemas using only Name (portable), then
+              pick the object whose type best matches the category.
               """
-              stages = [
-                  f'objectSchemaId = {OBJECT_SCHEMA_ID} AND Name = "{name}"',
-                  f'objectSchemaId = {OBJECT_SCHEMA_ID} AND Name ~ "{name}"',
-                  f'objectSchemaId = {OBJECT_SCHEMA_ID} AND objectType = "{category}" AND Name ~ "{name}"',
-              ]
-          
-              for aql in stages:
+              for sid in SCHEMA_IDS:
+                  # exact Name
+                  aql = f'objectSchemaId = {sid} AND Name = "{name}"'
                   data = _post_aql(aql) or {}
                   objs = data.get("objectEntries") or []
                   if objs:
-                      # If several, prefer the one whose objectType matches the category
-                      def _norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
-                      want = _norm(category)
-                      best = objs[0]
-                      for o in objs:
-                          otype = ((o.get("objectType") or {}).get("name")) or ""
-                          if _norm(otype) == want:
-                              return o
-                      return best
-              # Still nothing
-              print(f'  AQL miss (Name-based) in schema {OBJECT_SCHEMA_ID}: {category} / {name}')
+                      return _best_match(objs, category)
+          
+                  # fuzzy Name
+                  aql = f'objectSchemaId = {sid} AND Name ~ "{name}"'
+                  data = _post_aql(aql) or {}
+                  objs = data.get("objectEntries") or []
+                  if objs:
+                      return _best_match(objs, category)
+          
+              print(f"  AQL miss across schemas {SCHEMA_IDS}: {category} / {name}")
               return None
       
           def asset_url(object_id:int):
