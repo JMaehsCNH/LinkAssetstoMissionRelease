@@ -140,43 +140,78 @@ jobs:
               if r.status_code not in (200,201):
                   die(f"Failed to create remote link for {key}", r)
 
-          # -------- Assets lookup (schema 3) --------
-          AQL_PATHS = [
-              "/jsm/assets/workspace/{ws}/v1/object/aql",
-              "/gateway/api/jsm/assets/workspace/{ws}/v1/object/aql",
-              "/rest/servicedeskapi/assets/workspace/{ws}/v1/object/aql",
-          ]
-
-          def _post_aql(aql_query):
-              errors = []
-              for path in AQL_PATHS:
-                  url = f"{JIRA_SITE}{path.format(ws=ASSETS_WORKSPACE_ID)}"
-                  r = requests.post(url, headers=H, auth=AUTH,
-                                    json={"qlQuery": aql_query, "page": 1, "resultPerPage": 2})
-                  if r.status_code == 200:
-                      return r.json()
-                  # collect diagnostics and try next path
-                  errors.append(f"{url} -> {r.status_code}")
-              # none worked
-              die("Assets AQL search failed across endpoints: " + " | ".join(errors))
-          
-          def aql_lookup(category, name):
-              aql = (
-                  f'objectSchemaId = {OBJECT_SCHEMA_ID} '
-                  f'AND objectType = "{category}" '
-                  f'AND (Name = "{name}" OR "Serial Number" = "{name}")'
-              )
-              data = _post_aql(aql)
-              objs = (data or {}).get("objectEntries") or []
-              return objs[0] if objs else None
-
-
-          def asset_url(object_id:int):
-              return f"{JIRA_SITE}/jira/servicedesk/assets/objects/{object_id}"
-
-          # -------- Parse Description: ADF + plain text --------
-          bullet_re = re.compile(r"^(?:-|\*)\s+(?P<cat>.+?)\s*$")
-          child_re  = re.compile(r"^\s{2,}(?:-|\*)\s+(?P<name>.+?)\s*$")
+          # ---- Assets endpoints: try all common Cloud routes ----
+            AQL_PATHS = [
+                "/jsm/assets/workspace/{ws}/v1/object/aql",
+                "/gateway/api/jsm/assets/workspace/{ws}/v1/object/aql",
+                "/rest/servicedeskapi/assets/workspace/{ws}/v1/object/aql",
+            ]
+            
+            # Attribute names we’ll try (case-sensitive in AQL; add to this list if your schema differs)
+            ATTR_CANDIDATES = ["Name", "Serial Number", "SN", "Asset ID", "Asset Tag", "Device ID"]
+            
+            def _post_aql(aql_query):
+                errs = []
+                for path in AQL_PATHS:
+                    url = f"{JIRA_SITE}{path.format(ws=ASSETS_WORKSPACE_ID)}"
+                    r = requests.post(url, headers=H, auth=AUTH,
+                                      json={"qlQuery": aql_query, "page": 1, "resultPerPage": 10})
+                    if r.status_code == 200:
+                        return r.json() or {}
+                    errs.append(f"{url} -> {r.status_code}")
+                die("Assets AQL search failed across endpoints: " + " | ".join(errs))
+            
+            def _norm(s):
+                return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+            
+            def _singularize(label):
+                # crude singularization to help type matching
+                return re.sub(r"s$", "", label or "", flags=re.I)
+            
+            def _best_match(objects, category):
+                """
+                Prefer object whose objectType name matches the category (case/space-insensitive, singular allowed).
+                Otherwise return the first.
+                """
+                if not objects:
+                    return None
+                want = _norm(category)
+                want_sing = _norm(_singularize(category))
+                best = objects[0]
+                for o in objects:
+                    ot = ((o.get("objectType") or {}).get("name")) or ""
+                    n = _norm(ot)
+                    if n == want or n == want_sing:
+                        return o
+                return best
+            
+            def aql_lookup(category, name):
+                # 1) Build attribute-only OR clause inside the schema
+                attr_checks = [f'"{attr}" = "{name}"' for attr in ATTR_CANDIDATES]
+                attr_checks.append(f'Name ~ "{name}"')  # last-resort contains search
+                where = " OR ".join(attr_checks)
+            
+                aql = f'objectSchemaId = {OBJECT_SCHEMA_ID} AND ({where})'
+            
+                data = _post_aql(aql)
+                objs = data.get("objectEntries") or []
+            
+                if not objs:
+                    # helpful debug
+                    print(f"  AQL miss in schema {OBJECT_SCHEMA_ID}: {category} / {name} (tried attributes: {ATTR_CANDIDATES})")
+                    return None
+            
+                # 2) If multiple, prefer the one whose objectType matches the category label
+                return _best_match(objs, category)
+            
+            
+            
+                      def asset_url(object_id:int):
+                          return f"{JIRA_SITE}/jira/servicedesk/assets/objects/{object_id}"
+            
+                      # -------- Parse Description: ADF + plain text --------
+                      bullet_re = re.compile(r"^(?:-|\*)\s+(?P<cat>.+?)\s*$")
+                      child_re  = re.compile(r"^\s{2,}(?:-|\*)\s+(?P<name>.+?)\s*$")
 
           def _adf_text_from_paragraph(node):
               if not node or node.get("type") != "paragraph":
