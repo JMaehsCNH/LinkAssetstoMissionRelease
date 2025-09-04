@@ -8,21 +8,18 @@ on:
 jobs:
   scan-and-link:
     runs-on: ubuntu-latest
-    env:
-      # ---- FIXED BASE URL ----
-      JIRA_SITE: "https://cnhpd.atlassian.net"
+env:
+  JIRA_SITE: "https://cnhpd.atlassian.net"
+  JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+  JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+  ASSETS_WORKSPACE_ID: ${{ secrets.ASSETS_WORKSPACE_ID }}
 
-      # ---- REQUIRED SECRETS ----
-      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-      ASSETS_WORKSPACE_ID: ${{ secrets.ASSETS_WORKSPACE_ID }}
+  OBJECT_SCHEMA_ID: "3"   # PV Assets
+  JQL: >
+    project = PREC
+    AND issuetype = "Mission/Release"
+    AND status != "Validated (Complete)"
 
-      # ---- CONFIG ----
-      OBJECT_SCHEMA_ID: "3"   # PV Assets
-      JQL: >
-        project = PREC
-        AND issuetype in ("Mission","Release")
-        AND status != "Validated (Complete)"
 
     steps:
       - name: Set up Python
