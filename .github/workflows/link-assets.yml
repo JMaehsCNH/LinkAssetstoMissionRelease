@@ -126,7 +126,7 @@ jobs:
       
           # ---- Assets endpoints + helpers (TOP-LEVEL) ----
           AQL_PATHS = [
-              "/gateway/api/jsm/assets/workspace/{ws}/v1/object/aql",  # try gateway first
+              "/gateway/api/jsm/assets/workspace/{ws}/v1/object/aql",
               "/jsm/assets/workspace/{ws}/v1/object/aql",
               "/rest/servicedeskapi/assets/workspace/{ws}/v1/object/aql",
           ]
@@ -135,10 +135,10 @@ jobs:
           ATTR_CANDIDATES = ["Name", "Serial Number", "SN", "Asset ID", "Asset Tag", "Device ID"]
       
           def _post_aql(aql_query):
-              errs = []
+              """Return {} on failure instead of killing the whole run; we’ll try other stages."""
               payloads = [
-                  {"qlQuery": aql_query, "page": 1, "resultPerPage": 10},  # common
-                  {"aql": aql_query, "page": 1, "resultPerPage": 10},      # some tenants
+                  {"qlQuery": aql_query, "page": 1, "resultPerPage": 10},
+                  {"aql": aql_query, "page": 1, "resultPerPage": 10},  # some tenants accept this key
               ]
               for path in AQL_PATHS:
                   url = f"{JIRA_SITE}{path.format(ws=ASSETS_WORKSPACE_ID)}"
@@ -146,8 +146,8 @@ jobs:
                       r = requests.post(url, headers=H, auth=AUTH, json=body)
                       if r.status_code == 200:
                           return r.json() or {}
-                      errs.append(f"{url} ({list(body.keys())[0]}) -> {r.status_code} {r.text[:160]}")
-              die("Assets AQL search failed across endpoints: " + " | ".join(errs))
+              # If none worked, return empty result so caller can decide what to do
+              return {}
       
           def _norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
       
@@ -168,16 +168,32 @@ jobs:
               return best
       
           def aql_lookup(category, name):
-              attr_checks = [f'"{attr}" = "{name}"' for attr in ATTR_CANDIDATES]
-              attr_checks.append(f'Name ~ "{name}"')
-              where = " OR ".join(attr_checks)
-              aql = f'objectSchemaId = {OBJECT_SCHEMA_ID} AND ({where})'
-              data = _post_aql(aql)
-              objs = data.get("objectEntries") or []
-              if not objs:
-                  print(f"  AQL miss in schema {OBJECT_SCHEMA_ID}: {category} / {name} (tried: {ATTR_CANDIDATES})")
-                  return None
-              return _best_match(objs, category)
+              """
+              Safer staged search that only relies on Name (always present),
+              then falls back to fuzzy + objectType narrowing.
+              """
+              stages = [
+                  f'objectSchemaId = {OBJECT_SCHEMA_ID} AND Name = "{name}"',
+                  f'objectSchemaId = {OBJECT_SCHEMA_ID} AND Name ~ "{name}"',
+                  f'objectSchemaId = {OBJECT_SCHEMA_ID} AND objectType = "{category}" AND Name ~ "{name}"',
+              ]
+          
+              for aql in stages:
+                  data = _post_aql(aql) or {}
+                  objs = data.get("objectEntries") or []
+                  if objs:
+                      # If several, prefer the one whose objectType matches the category
+                      def _norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+                      want = _norm(category)
+                      best = objs[0]
+                      for o in objs:
+                          otype = ((o.get("objectType") or {}).get("name")) or ""
+                          if _norm(otype) == want:
+                              return o
+                      return best
+              # Still nothing
+              print(f'  AQL miss (Name-based) in schema {OBJECT_SCHEMA_ID}: {category} / {name}')
+              return None
       
           def asset_url(object_id:int):
               return f"{JIRA_SITE}/jira/servicedesk/assets/objects/{object_id}"
