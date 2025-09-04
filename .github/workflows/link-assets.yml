@@ -47,7 +47,11 @@ jobs:
           TYPE_REGEX          = os.environ.get("MISSION_RELEASE_TYPES", r"(?i)^mission\s*/\s*release$")
       
           AUTH = (JIRA_EMAIL, JIRA_API_TOKEN)
-          H    = {"Accept":"application/json","Content-Type":"application/json"}
+          H    = {
+            "Accept":"application/json",
+            "Content-Type":"application/json",
+            "X-ExperimentalApi":"opt-in"   # required by many Assets v1 routes
+          }
           type_pat = re.compile(TYPE_REGEX)
       
           def die(msg, r=None):
@@ -120,13 +124,16 @@ jobs:
               if r.status_code not in (200,201):
                   die(f"Failed to create remote link for {key}", r)
       
-          # ---- Assets endpoints + helpers (TOP-LEVEL, NO INDENT) ----
+          # ---- Assets endpoints + helpers (TOP-LEVEL) ----
           AQL_PATHS = [
-              "/gateway/api/jsm/assets/workspace/{ws}/v1/object/aql",   # try gateway first
+              "/gateway/api/jsm/assets/workspace/{ws}/v1/object/aql",  # try gateway first
               "/jsm/assets/workspace/{ws}/v1/object/aql",
               "/rest/servicedeskapi/assets/workspace/{ws}/v1/object/aql",
           ]
-          
+      
+          # define BEFORE aql_lookup()
+          ATTR_CANDIDATES = ["Name", "Serial Number", "SN", "Asset ID", "Asset Tag", "Device ID"]
+      
           def _post_aql(aql_query):
               errs = []
               payloads = [
@@ -139,9 +146,8 @@ jobs:
                       r = requests.post(url, headers=H, auth=AUTH, json=body)
                       if r.status_code == 200:
                           return r.json() or {}
-                      errs.append(f"{url} ({list(body.keys())[0]}) -> {r.status_code} {r.text[:200]}")
+                      errs.append(f"{url} ({list(body.keys())[0]}) -> {r.status_code} {r.text[:160]}")
               die("Assets AQL search failed across endpoints: " + " | ".join(errs))
-
       
           def _norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
       
