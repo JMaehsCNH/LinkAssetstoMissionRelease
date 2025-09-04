@@ -140,7 +140,7 @@ jobs:
               if r.status_code not in (200,201):
                   die(f"Failed to create remote link for {key}", r)
 
-          # ---- Assets endpoints: try all common Cloud routes ----
+            # ---- Assets endpoints: try all common Cloud routes ----
             AQL_PATHS = [
                 "/jsm/assets/workspace/{ws}/v1/object/aql",
                 "/gateway/api/jsm/assets/workspace/{ws}/v1/object/aql",
@@ -154,15 +154,18 @@ jobs:
                 errs = []
                 for path in AQL_PATHS:
                     url = f"{JIRA_SITE}{path.format(ws=ASSETS_WORKSPACE_ID)}"
-                    r = requests.post(url, headers=H, auth=AUTH,
-                                      json={"qlQuery": aql_query, "page": 1, "resultPerPage": 10})
+                    r = requests.post(
+                        url, headers=H, auth=AUTH,
+                        json={"qlQuery": aql_query, "page": 1, "resultPerPage": 10}
+                    )
                     if r.status_code == 200:
+                        # Uncomment to see which endpoint worked:
+                        # print(f"AQL OK via {url}")
                         return r.json() or {}
                     errs.append(f"{url} -> {r.status_code}")
                 die("Assets AQL search failed across endpoints: " + " | ".join(errs))
             
-            def _norm(s):
-                return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+            def _norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
             
             def _singularize(label):
                 # crude singularization to help type matching
@@ -197,12 +200,12 @@ jobs:
                 objs = data.get("objectEntries") or []
             
                 if not objs:
-                    # helpful debug
-                    print(f"  AQL miss in schema {OBJECT_SCHEMA_ID}: {category} / {name} (tried attributes: {ATTR_CANDIDATES})")
+                    print(f"  AQL miss in schema {OBJECT_SCHEMA_ID}: {category} / {name} (tried: {ATTR_CANDIDATES})")
                     return None
             
                 # 2) If multiple, prefer the one whose objectType matches the category label
                 return _best_match(objs, category)
+
             
             
             
