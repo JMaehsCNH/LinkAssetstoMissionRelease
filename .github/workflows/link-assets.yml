@@ -30,34 +30,14 @@ jobs:
       - name: Install deps
         run: pip install requests
 
-      - name: Debug – first 20 PREC keys with type & status
-        run: |
-          python - <<'PY'
-          import os, requests
-          JIRA_SITE=os.environ["JIRA_SITE"].rstrip("/")
-          AUTH=(os.environ["JIRA_EMAIL"], os.environ["JIRA_API_TOKEN"])
-          H={"Accept":"application/json"}
-          jql=os.environ["JQL"]
-          url=f"{JIRA_SITE}/rest/api/3/search/jql"
-          r=requests.get(url,headers=H,auth=AUTH,params={"jql":jql,"maxResults":20,"fields":"key,issuetype,status"})
-          r.raise_for_status()
-          data=r.json()
-          issues=data.get("issues",[])
-          print(f"Returned: {len(issues)}")
-          for i in issues:
-            key=i["key"]; it=i["fields"]["issuetype"]["name"]; st=i["fields"]["status"]["name"]
-            print(f"{key}  |  {it}  |  {st}")
-          PY
-
       - name: Query PREC and add asset web links (ADF-aware)
         env:
-          # Regex (case-insensitive) to match your issue type exactly, allowing optional spaces around '/'
           MISSION_RELEASE_TYPES: "(?i)^mission\\s*/\\s*release$"
         run: |
           python - <<'PY'
           import os, sys, json, time, re
           import requests
-
+      
           JIRA_SITE           = os.environ["JIRA_SITE"].rstrip("/")
           JIRA_EMAIL          = os.environ["JIRA_EMAIL"]
           JIRA_API_TOKEN      = os.environ["JIRA_API_TOKEN"]
@@ -65,18 +45,18 @@ jobs:
           OBJECT_SCHEMA_ID    = os.environ["OBJECT_SCHEMA_ID"]
           JQL                 = os.environ["JQL"]
           TYPE_REGEX          = os.environ.get("MISSION_RELEASE_TYPES", r"(?i)^mission\s*/\s*release$")
-
+      
           AUTH = (JIRA_EMAIL, JIRA_API_TOKEN)
           H    = {"Accept":"application/json","Content-Type":"application/json"}
           type_pat = re.compile(TYPE_REGEX)
-
+      
           def die(msg, r=None):
               if r is not None:
                   print(f"{msg} ({r.status_code}): {r.text}", file=sys.stderr)
               else:
                   print(msg, file=sys.stderr)
               sys.exit(1)
-
+      
           # -------- Enhanced JQL (cursor pagination) --------
           def search_get(jql, next_token=None, fields=None, max_results=100):
               url = f"{JIRA_SITE}/rest/api/3/search/jql"
@@ -86,7 +66,7 @@ jobs:
               if next_token:
                   params["nextPageToken"] = next_token
               return requests.get(url, headers=H, auth=AUTH, params=params)
-
+      
           def search_post(jql, next_token=None, fields=None, max_results=100):
               url = f"{JIRA_SITE}/rest/api/3/search/jql"
               body = {"jql": jql, "maxResults": max_results}
@@ -95,7 +75,7 @@ jobs:
               if next_token:
                   body["nextPageToken"] = next_token
               return requests.post(url, headers=H, auth=AUTH, json=body)
-
+      
           def enhanced_search(jql, wanted_fields):
               next_token = None
               while True:
@@ -110,7 +90,7 @@ jobs:
                   next_token = page.get("nextPageToken")
                   if not next_token:
                       break
-
+      
           # -------- Issue helpers --------
           def get_issue_desc(key):
               url = f"{JIRA_SITE}/rest/api/3/issue/{key}?fields=description"
@@ -118,7 +98,7 @@ jobs:
               if r.status_code != 200:
                   die(f"Failed to read description for {key}", r)
               return r.json().get("fields",{}).get("description")  # may be ADF dict or string
-
+      
           def list_remote_links(key):
               url = f"{JIRA_SITE}/rest/api/3/issue/{key}/remotelink"
               r = requests.get(url, headers=H, auth=AUTH)
@@ -133,89 +113,72 @@ jobs:
                   if title and url:
                       existing.add((title.strip(), url.strip()))
               return existing
-
+      
           def create_remote_link(key, title, url_):
               url = f"{JIRA_SITE}/rest/api/3/issue/{key}/remotelink"
               r = requests.post(url, headers=H, auth=AUTH, json={"object":{"title": title, "url": url_}})
               if r.status_code not in (200,201):
                   die(f"Failed to create remote link for {key}", r)
-
-            # ---- Assets endpoints: try all common Cloud routes ----
-            AQL_PATHS = [
-                "/jsm/assets/workspace/{ws}/v1/object/aql",
-                "/gateway/api/jsm/assets/workspace/{ws}/v1/object/aql",
-                "/rest/servicedeskapi/assets/workspace/{ws}/v1/object/aql",
-            ]
-            
-            # Attribute names we’ll try (case-sensitive in AQL; add to this list if your schema differs)
-            ATTR_CANDIDATES = ["Name", "Serial Number", "SN", "Asset ID", "Asset Tag", "Device ID"]
-            
-            def _post_aql(aql_query):
-                errs = []
-                for path in AQL_PATHS:
-                    url = f"{JIRA_SITE}{path.format(ws=ASSETS_WORKSPACE_ID)}"
-                    r = requests.post(
-                        url, headers=H, auth=AUTH,
-                        json={"qlQuery": aql_query, "page": 1, "resultPerPage": 10}
-                    )
-                    if r.status_code == 200:
-                        # Uncomment to see which endpoint worked:
-                        # print(f"AQL OK via {url}")
-                        return r.json() or {}
-                    errs.append(f"{url} -> {r.status_code}")
-                die("Assets AQL search failed across endpoints: " + " | ".join(errs))
-            
-            def _norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
-            
-            def _singularize(label):
-                # crude singularization to help type matching
-                return re.sub(r"s$", "", label or "", flags=re.I)
-            
-            def _best_match(objects, category):
-                """
-                Prefer object whose objectType name matches the category (case/space-insensitive, singular allowed).
-                Otherwise return the first.
-                """
-                if not objects:
-                    return None
-                want = _norm(category)
-                want_sing = _norm(_singularize(category))
-                best = objects[0]
-                for o in objects:
-                    ot = ((o.get("objectType") or {}).get("name")) or ""
-                    n = _norm(ot)
-                    if n == want or n == want_sing:
-                        return o
-                return best
-            
-            def aql_lookup(category, name):
-                # 1) Build attribute-only OR clause inside the schema
-                attr_checks = [f'"{attr}" = "{name}"' for attr in ATTR_CANDIDATES]
-                attr_checks.append(f'Name ~ "{name}"')  # last-resort contains search
-                where = " OR ".join(attr_checks)
-            
-                aql = f'objectSchemaId = {OBJECT_SCHEMA_ID} AND ({where})'
-            
-                data = _post_aql(aql)
-                objs = data.get("objectEntries") or []
-            
-                if not objs:
-                    print(f"  AQL miss in schema {OBJECT_SCHEMA_ID}: {category} / {name} (tried: {ATTR_CANDIDATES})")
-                    return None
-            
-                # 2) If multiple, prefer the one whose objectType matches the category label
-                return _best_match(objs, category)
-
-            
-            
-            
+      
+          # ---- Assets endpoints + helpers (TOP-LEVEL, NO INDENT) ----
+          AQL_PATHS = [
+              "/jsm/assets/workspace/{ws}/v1/object/aql",
+              "/gateway/api/jsm/assets/workspace/{ws}/v1/object/aql",
+              "/rest/servicedeskapi/assets/workspace/{ws}/v1/object/aql",
+          ]
+      
+          ATTR_CANDIDATES = ["Name", "Serial Number", "SN", "Asset ID", "Asset Tag", "Device ID"]
+      
+          def _post_aql(aql_query):
+              errs = []
+              for path in AQL_PATHS:
+                  url = f"{JIRA_SITE}{path.format(ws=ASSETS_WORKSPACE_ID)}"
+                  r = requests.post(
+                      url, headers=H, auth=AUTH,
+                      json={"qlQuery": aql_query, "page": 1, "resultPerPage": 10}
+                  )
+                  if r.status_code == 200:
+                      return r.json() or {}
+                  errs.append(f"{url} -> {r.status_code}")
+              die("Assets AQL search failed across endpoints: " + " | ".join(errs))
+      
+          def _norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+      
+          def _singularize(label):
+              return re.sub(r"s$", "", label or "", flags=re.I)
+      
+          def _best_match(objects, category):
+              if not objects:
+                  return None
+              want = _norm(category)
+              want_sing = _norm(_singularize(category))
+              best = objects[0]
+              for o in objects:
+                  ot = ((o.get("objectType") or {}).get("name")) or ""
+                  n = _norm(ot)
+                  if n == want or n == want_sing:
+                      return o
+              return best
+      
+          def aql_lookup(category, name):
+              attr_checks = [f'"{attr}" = "{name}"' for attr in ATTR_CANDIDATES]
+              attr_checks.append(f'Name ~ "{name}"')
+              where = " OR ".join(attr_checks)
+              aql = f'objectSchemaId = {OBJECT_SCHEMA_ID} AND ({where})'
+              data = _post_aql(aql)
+              objs = data.get("objectEntries") or []
+              if not objs:
+                  print(f"  AQL miss in schema {OBJECT_SCHEMA_ID}: {category} / {name} (tried: {ATTR_CANDIDATES})")
+                  return None
+              return _best_match(objs, category)
+      
           def asset_url(object_id:int):
               return f"{JIRA_SITE}/jira/servicedesk/assets/objects/{object_id}"
-
+      
           # -------- Parse Description: ADF + plain text --------
           bullet_re = re.compile(r"^(?:-|\*)\s+(?P<cat>.+?)\s*$")
           child_re  = re.compile(r"^\s{2,}(?:-|\*)\s+(?P<name>.+?)\s*$")
-
+      
           def _adf_text_from_paragraph(node):
               if not node or node.get("type") != "paragraph":
                   return ""
@@ -224,7 +187,7 @@ jobs:
                   if frag.get("type") == "text" and "text" in frag:
                       out.append(frag["text"])
               return "".join(out).strip()
-
+      
           def _adf_pairs_from_list(list_node):
               pairs = []
               if not list_node or list_node.get("type") != "bulletList":
@@ -253,7 +216,7 @@ jobs:
                               if name:
                                   pairs.append((cat, name))
               return pairs
-
+      
           def extract_pairs(desc):
               if isinstance(desc, dict) and desc.get("type") == "doc":
                   pairs = []
@@ -273,30 +236,30 @@ jobs:
                       nm = m2.group("name").strip()
                       if nm: pairs.append((current_cat, nm))
               return pairs
-
+      
           # -------- Main --------
           wanted_fields = ["summary","description","issuetype","project","status"]
           total_scanned = 0
-
+      
           for issue in enhanced_search(JQL, wanted_fields):
               key    = issue["key"]
               f      = issue.get("fields") or {}
               proj   = f.get("project", {}).get("key")
               itype  = (f.get("issuetype", {}) or {}).get("name","")
               status = (f.get("status", {}) or {}).get("name","")
-
+      
               if proj != "PREC" or not type_pat.match(itype or "") or status == "Validated (Complete)":
                   continue
-
+      
               desc = f.get("description")
               if desc is None:
                   desc = get_issue_desc(key)
-
+      
               pairs = extract_pairs(desc)
               if not pairs:
                   print(f"{key}: no asset tree detected; skipping")
                   continue
-
+      
               existing = list_remote_links(key)
               for cat, nm in pairs:
                   obj = aql_lookup(cat, nm)
@@ -311,9 +274,9 @@ jobs:
                       continue
                   create_remote_link(key, title, url_)
                   print(f"{key}: linked {title}")
-
+      
               total_scanned += 1
               time.sleep(0.2)
-
+      
           print(f"Done. Issues scanned: {total_scanned}")
           PY
