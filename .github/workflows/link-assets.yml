@@ -42,7 +42,8 @@ jobs:
           JIRA_EMAIL          = os.environ["JIRA_EMAIL"]
           JIRA_API_TOKEN      = os.environ["JIRA_API_TOKEN"]
           ASSETS_WORKSPACE_ID = os.environ["ASSETS_WORKSPACE_ID"]
-          OBJECT_SCHEMA_ID    = os.environ["OBJECT_SCHEMA_ID"]
+          # <-- parse the CSV list from env
+          SCHEMA_IDS          = [int(s) for s in os.getenv("OBJECT_SCHEMA_IDS","3").replace(" ","").split(",") if s]
           JQL                 = os.environ["JQL"]
           TYPE_REGEX          = os.environ.get("MISSION_RELEASE_TYPES", r"(?i)^mission\s*/\s*release$")
       
@@ -50,7 +51,7 @@ jobs:
           H    = {
             "Accept":"application/json",
             "Content-Type":"application/json",
-            "X-ExperimentalApi":"opt-in"   # required by many Assets v1 routes
+            "X-ExperimentalApi":"opt-in"
           }
           type_pat = re.compile(TYPE_REGEX)
       
@@ -65,19 +66,15 @@ jobs:
           def search_get(jql, next_token=None, fields=None, max_results=100):
               url = f"{JIRA_SITE}/rest/api/3/search/jql"
               params = {"jql": jql, "maxResults": max_results}
-              if fields:
-                  params["fields"] = ",".join(fields)
-              if next_token:
-                  params["nextPageToken"] = next_token
+              if fields: params["fields"] = ",".join(fields)
+              if next_token: params["nextPageToken"] = next_token
               return requests.get(url, headers=H, auth=AUTH, params=params)
       
           def search_post(jql, next_token=None, fields=None, max_results=100):
               url = f"{JIRA_SITE}/rest/api/3/search/jql"
               body = {"jql": jql, "maxResults": max_results}
-              if fields:
-                  body["fields"] = fields
-              if next_token:
-                  body["nextPageToken"] = next_token
+              if fields: body["fields"] = fields
+              if next_token: body["nextPageToken"] = next_token
               return requests.post(url, headers=H, auth=AUTH, json=body)
       
           def enhanced_search(jql, wanted_fields):
@@ -92,53 +89,44 @@ jobs:
                   for issue in page.get("issues", []):
                       yield issue
                   next_token = page.get("nextPageToken")
-                  if not next_token:
-                      break
+                  if not next_token: break
       
           # -------- Issue helpers --------
           def get_issue_desc(key):
               url = f"{JIRA_SITE}/rest/api/3/issue/{key}?fields=description"
               r = requests.get(url, headers=H, auth=AUTH)
-              if r.status_code != 200:
-                  die(f"Failed to read description for {key}", r)
-              return r.json().get("fields",{}).get("description")  # may be ADF dict or string
+              if r.status_code != 200: die(f"Failed to read description for {key}", r)
+              return r.json().get("fields",{}).get("description")
       
           def list_remote_links(key):
               url = f"{JIRA_SITE}/rest/api/3/issue/{key}/remotelink"
               r = requests.get(url, headers=H, auth=AUTH)
-              if r.status_code != 200:
-                  die(f"Failed to list remote links for {key}", r)
+              if r.status_code != 200: die(f"Failed to list remote links for {key}", r)
               links = r.json() if isinstance(r.json(), list) else []
               existing = set()
               for l in links:
                   obj = l.get("object",{})
                   title = obj.get("title") or ""
                   url   = obj.get("url") or ""
-                  if title and url:
-                      existing.add((title.strip(), url.strip()))
+                  if title and url: existing.add((title.strip(), url.strip()))
               return existing
       
           def create_remote_link(key, title, url_):
               url = f"{JIRA_SITE}/rest/api/3/issue/{key}/remotelink"
               r = requests.post(url, headers=H, auth=AUTH, json={"object":{"title": title, "url": url_}})
-              if r.status_code not in (200,201):
-                  die(f"Failed to create remote link for {key}", r)
+              if r.status_code not in (200,201): die(f"Failed to create remote link for {key}", r)
       
-          # ---- Assets endpoints + helpers (TOP-LEVEL) ----
+          # ---- Assets endpoints + helpers ----
           AQL_PATHS = [
               "/gateway/api/jsm/assets/workspace/{ws}/v1/object/aql",
               "/jsm/assets/workspace/{ws}/v1/object/aql",
               "/rest/servicedeskapi/assets/workspace/{ws}/v1/object/aql",
           ]
       
-          # define BEFORE aql_lookup()
-          ATTR_CANDIDATES = ["Name", "Serial Number", "SN", "Asset ID", "Asset Tag", "Device ID"]
-      
           def _post_aql(aql_query):
-              """Return {} on failure instead of killing the whole run; we’ll try other stages."""
               payloads = [
                   {"qlQuery": aql_query, "page": 1, "resultPerPage": 10},
-                  {"aql": aql_query, "page": 1, "resultPerPage": 10},  # some tenants accept this key
+                  {"aql": aql_query,     "page": 1, "resultPerPage": 10},
               ]
               for path in AQL_PATHS:
                   url = f"{JIRA_SITE}{path.format(ws=ASSETS_WORKSPACE_ID)}"
@@ -146,47 +134,32 @@ jobs:
                       r = requests.post(url, headers=H, auth=AUTH, json=body)
                       if r.status_code == 200:
                           return r.json() or {}
-              # If none worked, return empty result so caller can decide what to do
               return {}
       
           def _norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
-      
-          def _singularize(label):
-              return re.sub(r"s$", "", label or "", flags=re.I)
+          def _singularize(label): return re.sub(r"s$", "", label or "", flags=re.I)
       
           def _best_match(objects, category):
-              if not objects:
-                  return None
-              want = _norm(category)
-              want_sing = _norm(_singularize(category))
+              if not objects: return None
+              want = _norm(category); want_sing = _norm(_singularize(category))
               best = objects[0]
               for o in objects:
                   ot = ((o.get("objectType") or {}).get("name")) or ""
                   n = _norm(ot)
-                  if n == want or n == want_sing:
-                      return o
+                  if n == want or n == want_sing: return o
               return best
       
+          # Search across *all* schema IDs from env
           def aql_lookup(category, name):
-              """
-              Search across multiple schemas using only Name (portable), then
-              pick the object whose type best matches the category.
-              """
               for sid in SCHEMA_IDS:
-                  # exact Name
-                  aql = f'objectSchemaId = {sid} AND Name = "{name}"'
-                  data = _post_aql(aql) or {}
+                  data = _post_aql(f'objectSchemaId = {sid} AND Name = "{name}"') or {}
                   objs = data.get("objectEntries") or []
-                  if objs:
-                      return _best_match(objs, category)
-          
-                  # fuzzy Name
-                  aql = f'objectSchemaId = {sid} AND Name ~ "{name}"'
-                  data = _post_aql(aql) or {}
+                  if objs: return _best_match(objs, category)
+      
+                  data = _post_aql(f'objectSchemaId = {sid} AND Name ~ "{name}"') or {}
                   objs = data.get("objectEntries") or []
-                  if objs:
-                      return _best_match(objs, category)
-          
+                  if objs: return _best_match(objs, category)
+      
               print(f"  AQL miss across schemas {SCHEMA_IDS}: {category} / {name}")
               return None
       
@@ -198,41 +171,33 @@ jobs:
           child_re  = re.compile(r"^\s{2,}(?:-|\*)\s+(?P<name>.+?)\s*$")
       
           def _adf_text_from_paragraph(node):
-              if not node or node.get("type") != "paragraph":
-                  return ""
+              if not node or node.get("type") != "paragraph": return ""
               out = []
               for frag in node.get("content", []) or []:
-                  if frag.get("type") == "text" and "text" in frag:
-                      out.append(frag["text"])
+                  if frag.get("type") == "text" and "text" in frag: out.append(frag["text"])
               return "".join(out).strip()
       
           def _adf_pairs_from_list(list_node):
               pairs = []
-              if not list_node or list_node.get("type") != "bulletList":
-                  return pairs
+              if not list_node or list_node.get("type") != "bulletList": return pairs
               for li in list_node.get("content", []) or []:
-                  if li.get("type") != "listItem":
-                      continue
+                  if li.get("type") != "listItem": continue
                   children = li.get("content", []) or []
                   cat = None
                   for ch in children:
                       if ch.get("type") == "paragraph":
-                          cat = _adf_text_from_paragraph(ch)
-                          break
-                  if not cat:
-                      continue
+                          cat = _adf_text_from_paragraph(ch); break
+                  if not cat: continue
                   for ch in children:
                       if ch.get("type") == "bulletList":
                           for sub_li in ch.get("content", []) or []:
-                              if sub_li.get("type") != "listItem":
-                                  continue
+                              if sub_li.get("type") != "listItem": continue
                               name = ""
                               for sub_ch in sub_li.get("content", []) or []:
                                   if sub_ch.get("type") == "paragraph":
-                                      name = _adf_text_from_paragraph(sub_ch)
+                                      name = _adf_text_from_paragraph(sub_ch); 
                                       if name: break
-                              if name:
-                                  pairs.append((cat, name))
+                              if name: pairs.append((cat, name))
               return pairs
       
           def extract_pairs(desc):
@@ -247,8 +212,7 @@ jobs:
               for raw in (text or "").splitlines():
                   line = raw.rstrip()
                   m1 = bullet_re.match(line)
-                  if m1:
-                      current_cat = m1.group("cat").strip(); continue
+                  if m1: current_cat = m1.group("cat").strip(); continue
                   m2 = child_re.match(line)
                   if m2 and current_cat:
                       nm = m2.group("name").strip()
@@ -270,8 +234,7 @@ jobs:
                   continue
       
               desc = f.get("description")
-              if desc is None:
-                  desc = get_issue_desc(key)
+              if desc is None: desc = get_issue_desc(key)
       
               pairs = extract_pairs(desc)
               if not pairs:
@@ -282,7 +245,7 @@ jobs:
               for cat, nm in pairs:
                   obj = aql_lookup(cat, nm)
                   if not obj:
-                      print(f"{key}: not found in Assets (schema 3) → {cat} / {nm}")
+                      print(f"{key}: not found in Assets → {cat} / {nm}")
                       continue
                   oid = obj.get("id")
                   url_ = asset_url(oid)
