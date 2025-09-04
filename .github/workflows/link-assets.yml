@@ -122,25 +122,26 @@ jobs:
       
           # ---- Assets endpoints + helpers (TOP-LEVEL, NO INDENT) ----
           AQL_PATHS = [
+              "/gateway/api/jsm/assets/workspace/{ws}/v1/object/aql",   # try gateway first
               "/jsm/assets/workspace/{ws}/v1/object/aql",
-              "/gateway/api/jsm/assets/workspace/{ws}/v1/object/aql",
               "/rest/servicedeskapi/assets/workspace/{ws}/v1/object/aql",
           ]
-      
-          ATTR_CANDIDATES = ["Name", "Serial Number", "SN", "Asset ID", "Asset Tag", "Device ID"]
-      
+          
           def _post_aql(aql_query):
               errs = []
+              payloads = [
+                  {"qlQuery": aql_query, "page": 1, "resultPerPage": 10},  # common
+                  {"aql": aql_query, "page": 1, "resultPerPage": 10},      # some tenants
+              ]
               for path in AQL_PATHS:
                   url = f"{JIRA_SITE}{path.format(ws=ASSETS_WORKSPACE_ID)}"
-                  r = requests.post(
-                      url, headers=H, auth=AUTH,
-                      json={"qlQuery": aql_query, "page": 1, "resultPerPage": 10}
-                  )
-                  if r.status_code == 200:
-                      return r.json() or {}
-                  errs.append(f"{url} -> {r.status_code}")
+                  for body in payloads:
+                      r = requests.post(url, headers=H, auth=AUTH, json=body)
+                      if r.status_code == 200:
+                          return r.json() or {}
+                      errs.append(f"{url} ({list(body.keys())[0]}) -> {r.status_code} {r.text[:200]}")
               die("Assets AQL search failed across endpoints: " + " | ".join(errs))
+
       
           def _norm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
       
