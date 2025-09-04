@@ -1,4 +1,39 @@
-- name: Query PREC missions/releases and add asset web links (enhanced JQL)
+name: PREC | Link Assets from Description
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "16 3 * * *"  # daily at 03:16 UTC (adjust as needed)
+
+jobs:
+  scan-and-link:
+    runs-on: ubuntu-latest
+    env:
+      # ---- FIXED BASE URL ----
+      JIRA_SITE: https://cnhpd.atlassian.net
+
+      # ---- REQUIRED SECRETS ----
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      ASSETS_WORKSPACE_ID: ${{ secrets.ASSETS_WORKSPACE_ID }}
+
+      # ---- CONFIG ----
+      OBJECT_SCHEMA_ID: "3"   # PV Assets
+      JQL: >
+        project = PREC
+        AND issuetype in ("Mission","Release")
+        AND status != "Validated (Complete)"
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+     - name: Query PREC missions/releases and add asset web links (enhanced JQL)
   run: |
     python - <<'PY'
     import os, sys, json, time, re
@@ -21,43 +56,30 @@
             print(msg, file=sys.stderr)
         sys.exit(1)
 
-    # ---------- Enhanced JQL search helpers ----------
+    # ---------- Enhanced JQL search with cursor pagination ----------
     def search_issues_get(jql, next_token=None, fields=None, max_results=100):
-        """
-        GET /rest/api/3/search/jql with cursor pagination
-        """
         url = f"{JIRA_SITE}/rest/api/3/search/jql"
         params = {"jql": jql, "maxResults": max_results}
         if fields:
-            # comma-separated list per Atlassian docs
             params["fields"] = ",".join(fields)
         if next_token:
             params["nextPageToken"] = next_token
-        r = requests.get(url, headers=H, auth=AUTH, params=params)
-        return r
+        return requests.get(url, headers=H, auth=AUTH, params=params)
 
     def search_issues_post(jql, next_token=None, fields=None, max_results=100):
-        """
-        POST /rest/api/3/search/jql with cursor pagination (fallback)
-        """
         url = f"{JIRA_SITE}/rest/api/3/search/jql"
         body = {"jql": jql, "maxResults": max_results}
         if fields:
             body["fields"] = fields
         if next_token:
             body["nextPageToken"] = next_token
-        r = requests.post(url, headers=H, auth=AUTH, json=body)
-        return r
+        return requests.post(url, headers=H, auth=AUTH, json=body)
 
     def enhanced_search(jql, wanted_fields):
-        """
-        Generator over issues using the enhanced endpoint with fallback
-        """
         next_token = None
         while True:
-            # try GET first (preferred), then fallback to POST if needed
             r = search_issues_get(jql, next_token=next_token, fields=wanted_fields)
-            if r.status_code == 410 or r.status_code == 404 or r.status_code == 405:
+            if r.status_code in (404,405,410):
                 r = search_issues_post(jql, next_token=next_token, fields=wanted_fields)
             if r.status_code != 200:
                 die("Jira enhanced search failed", r)
@@ -68,7 +90,7 @@
             if not next_token:
                 break
 
-    # ---------- Issue detail helpers ----------
+    # ---------- Issue helpers ----------
     def get_issue_desc(key):
         url = f"{JIRA_SITE}/rest/api/3/issue/{key}?fields=description"
         r = requests.get(url, headers=H, auth=AUTH)
@@ -175,7 +197,7 @@
             print(f"{key}: linked {title}")
 
         total_scanned += 1
-        time.sleep(0.2)  # be nice to the API
+        time.sleep(0.2)
 
     print(f"Done. Issues scanned: {total_scanned}")
     PY
