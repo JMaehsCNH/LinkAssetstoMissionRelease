@@ -206,12 +206,12 @@ jobs:
             
             
             
-                      def asset_url(object_id:int):
-                          return f"{JIRA_SITE}/jira/servicedesk/assets/objects/{object_id}"
-            
-                      # -------- Parse Description: ADF + plain text --------
-                      bullet_re = re.compile(r"^(?:-|\*)\s+(?P<cat>.+?)\s*$")
-                      child_re  = re.compile(r"^\s{2,}(?:-|\*)\s+(?P<name>.+?)\s*$")
+          def asset_url(object_id:int):
+              return f"{JIRA_SITE}/jira/servicedesk/assets/objects/{object_id}"
+
+          # -------- Parse Description: ADF + plain text --------
+          bullet_re = re.compile(r"^(?:-|\*)\s+(?P<cat>.+?)\s*$")
+          child_re  = re.compile(r"^\s{2,}(?:-|\*)\s+(?P<name>.+?)\s*$")
 
           def _adf_text_from_paragraph(node):
               if not node or node.get("type") != "paragraph":
