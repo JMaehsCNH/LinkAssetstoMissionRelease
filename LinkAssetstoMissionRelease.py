@@ -19,7 +19,7 @@ if not all([JIRA_EMAIL, JIRA_API_TOKEN, ASSETS_WORKSPACE_ID]):
     sys.exit(1)
 
 AUTH = (JIRA_EMAIL, JIRA_API_TOKEN)
-H    = {"Accept":"application/json","Content-Type":"application/json"}
+H    = {"Accept":"application/json","Content-Type":"application/json","X-ExperimentalApi": "opt-in",   # <-- important for Assets v1}
 
 def die(msg, r=None):
     if r is not None:
