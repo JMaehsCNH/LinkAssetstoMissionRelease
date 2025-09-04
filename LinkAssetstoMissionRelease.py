@@ -113,10 +113,82 @@ def asset_url(object_id:int):
 bullet_re = re.compile(r"^(?:-|\*)\s+(?P<cat>.+?)\s*$")
 child_re  = re.compile(r"^\s{2,}(?:-|\*)\s+(?P<name>.+?)\s*$")
 
-def extract_pairs(desc_text):
+# ---------- Parse the bullet tree (supports Markdown *and* ADF) ----------
+bullet_re = re.compile(r"^(?:-|\*)\s+(?P<cat>.+?)\s*$")
+child_re  = re.compile(r"^\s{2,}(?:-|\*)\s+(?P<name>.+?)\s*$")
+
+def _adf_text_from_paragraph(node):
+    """Concatenate text content from an ADF paragraph node."""
+    if not node or node.get("type") != "paragraph":
+        return ""
+    out = []
+    for frag in node.get("content", []) or []:
+        if frag.get("type") == "text" and "text" in frag:
+            out.append(frag["text"])
+    return "".join(out).strip()
+
+def _adf_pairs_from_list(list_node):
+    """
+    Given an ADF bulletList node, return [(Category, Name), ...]
+    We treat each top-level listItem's paragraph as a Category,
+    and any nested bulletList items under it as Names.
+    """
     pairs = []
-    current_cat = None
-    text = desc_text if isinstance(desc_text, str) else ""
+    if not list_node or list_node.get("type") != "bulletList":
+        return pairs
+
+    for li in list_node.get("content", []) or []:  # listItem nodes
+        if li.get("type") != "listItem":
+            continue
+        # ListItem usually has: [ paragraph, (optional) bulletList ]
+        children = li.get("content", []) or []
+        if not children:
+            continue
+
+        # First paragraph = category
+        cat = None
+        for ch in children:
+            if ch.get("type") == "paragraph":
+                cat = _adf_text_from_paragraph(ch)
+                break
+        if not cat:
+            continue
+
+        # Find nested bulletList(s) for names
+        has_child = False
+        for ch in children:
+            if ch.get("type") == "bulletList":
+                for sub_li in ch.get("content", []) or []:
+                    if sub_li.get("type") != "listItem":
+                        continue
+                    # name = first paragraph text inside the sub listItem
+                    name = ""
+                    for sub_ch in sub_li.get("content", []) or []:
+                        if sub_ch.get("type") == "paragraph":
+                            name = _adf_text_from_paragraph(sub_ch)
+                            if name:
+                                break
+                    if name:
+                        pairs.append((cat, name))
+                        has_child = True
+        # If no nested list, treat the category itself as a single-name row? (not our use case)
+    return pairs
+
+def extract_pairs(desc):
+    """
+    Accepts either a plain string (Markdown-ish) or an ADF dict.
+    Returns list of (Category, Name).
+    """
+    if isinstance(desc, dict):  # ADF
+        pairs = []
+        for node in (desc.get("content") or []):
+            if node.get("type") == "bulletList":
+                pairs.extend(_adf_pairs_from_list(node))
+        return pairs
+
+    # Fallback: plain text bullets with indentation
+    text = desc if isinstance(desc, str) else ""
+    pairs, current_cat = [], None
     for raw in (text or "").splitlines():
         line = raw.rstrip()
         m1 = bullet_re.match(line)
@@ -146,8 +218,9 @@ def main():
         if proj != "PREC" or itype != "Mission/Release" or status == "Validated (Complete)":
             continue
 
-        desc = fields.get("description") or ""
-        pairs = extract_pairs(desc if isinstance(desc, str) else get_issue_desc(key))
+        desc = fields.get("description") or get_issue_desc(key)  # may be ADF dict or string
+        pairs = extract_pairs(desc)
+
         if not pairs:
             print(f"{key}: no asset tree detected; skipping")
             continue
