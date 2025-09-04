@@ -10,7 +10,7 @@ JIRA_EMAIL          = os.environ.get("JIRA_EMAIL")
 JIRA_API_TOKEN      = os.environ.get("JIRA_API_TOKEN")
 ASSETS_WORKSPACE_ID = os.environ.get("ASSETS_WORKSPACE_ID")
 JQL                 = os.environ.get("JQL") or (
-    'project = PREC AND issuetype in ("Mission","Release") AND status != "Validated (Complete)"'
+    'project = PREC AND issuetype in ("Mission/Release") AND status != "Validated (Complete)"'
 )
 
 if not all([JIRA_EMAIL, JIRA_API_TOKEN, ASSETS_WORKSPACE_ID]):
@@ -27,14 +27,82 @@ def die(msg, r=None):
         print(msg, file=sys.stderr)
     sys.exit(1)
 
-def search_issues(jql, start_at=0, max_results=50):
-    url = f"{JIRA_SITE}/rest/api/3/search"
-    payload = {"jql": jql, "startAt": start_at, "maxResults": max_results,
-               "fields": ["summary","description","issuetype","project","status"]}
-    r = requests.post(url, headers=H, auth=AUTH, json=payload)
+# ---- Jira Search (enhanced JQL) ----
+def search_issues(jql, next_token=None, max_results=100):
+    """
+    Uses the new enhanced JQL endpoint with cursor pagination.
+    Docs: /rest/api/3/search/jql (GET) + nextPageToken
+    """
+    url = f"{JIRA_SITE}/rest/api/3/search/jql"
+    params = {
+        "jql": jql,
+        "maxResults": max_results,  # Jira may cap/ignore; still pass a sensible value
+        # You can also add "fields" here, but Atlassian recommends using 'fields' in a POST body;
+        # for simplicity we GET everything and read fields later per issue.
+    }
+    if next_token:
+        params["nextPageToken"] = next_token
+
+    r = requests.get(url, headers=H, auth=AUTH, params=params)
     if r.status_code != 200:
-        die("Jira search failed", r)
+        die("Jira enhanced search failed", r)
     return r.json()
+
+# ---- Main loop (cursor-based) ----
+total_scanned = 0
+next_token = None
+
+while True:
+    page = search_issues(JQL, next_token=next_token, max_results=100)
+    issues = page.get("issues", [])
+
+    if not issues:
+        break
+
+    for issue in issues:
+        key   = issue["key"]
+        fields= issue.get("fields") or {}
+        proj  = fields.get("project", {}).get("key")
+        itype = fields.get("issuetype", {}).get("name")
+        status= fields.get("status", {}).get("name")
+
+        # Double-guard
+        if proj != "PREC" or itype not in ("Mission","Release") or status == "Validated (Complete)":
+            continue
+
+        desc = fields.get("description") or ""
+        pairs = extract_pairs(desc if isinstance(desc, str) else get_issue_desc(key))
+        if not pairs:
+            print(f"{key}: no asset tree detected; skipping")
+            continue
+
+        existing = list_remote_links(key)
+        for cat, nm in pairs:
+            obj = aql_lookup(cat, nm)
+            if not obj:
+                print(f"{key}: not found in Assets (schema 3) → {cat} / {nm}")
+                continue
+            oid = obj.get("id")
+            url_ = asset_url(oid)
+            title = f"{cat} - {nm}"
+
+            if (title, url_) in existing:
+                print(f"{key}: link already exists → {title}")
+                continue
+
+            create_remote_link(key, title, url_)
+            existing.add((title, url_))
+            print(f"{key}: linked {title}")
+
+        total_scanned += 1
+
+    # move the cursor forward; stop when no token is returned
+    next_token = page.get("nextPageToken")
+    if not next_token:
+        break
+
+print(f"Done. Issues scanned: {total_scanned}")
+
 
 def get_issue_desc(key):
     url = f"{JIRA_SITE}/rest/api/3/issue/{key}?fields=description"
