@@ -3,7 +3,7 @@ name: "PREC | Link Assets from Description"
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "16 3 * * *"  # daily at 03:16 UTC
+    - cron: "16 3 * * *"
 
 jobs:
   scan-and-link:
@@ -13,13 +13,13 @@ jobs:
       JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
       JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
       ASSETS_WORKSPACE_ID: ${{ secrets.ASSETS_WORKSPACE_ID }}
-    
-      OBJECT_SCHEMA_ID: "3"   # PV Assets
-      JQL: >
-        project = PREC
-        AND issuetype = "Mission/Release"
-        AND status != "Validated (Complete)"
 
+      OBJECT_SCHEMA_ID: "3"   # PV Assets
+      # BROAD JQL (we'll filter in code by issue type)
+      JQL: >
+        project = PREC AND statusCategory != Done
+      # Regex for the issue type (case-insensitive). Adjust if needed.
+      MISSION_RELEASE_TYPES: "(?i)^mission\\s*/\\s*release$"
 
     steps:
       - name: Set up Python
@@ -30,7 +30,28 @@ jobs:
       - name: Install deps
         run: pip install requests
 
-      - name: Query PREC missions/releases and add asset web links (enhanced JQL)
+      - name: Debug – list first 20 PREC keys with type & status
+        run: |
+          python - <<'PY'
+          import os, requests
+          JIRA_SITE=os.environ["JIRA_SITE"].rstrip("/")
+          AUTH=(os.environ["JIRA_EMAIL"], os.environ["JIRA_API_TOKEN"])
+          H={"Accept":"application/json"}
+          jql=os.environ["JQL"]
+          url=f"{JIRA_SITE}/rest/api/3/search/jql"
+          r=requests.get(url,headers=H,auth=AUTH,params={"jql":jql,"maxResults":20,"fields":"key,issuetype,status"})
+          r.raise_for_status()
+          data=r.json()
+          issues=data.get("issues",[])
+          print(f"Returned: {len(issues)}")
+          for i in issues:
+            key=i["key"]
+            itype=i["fields"]["issuetype"]["name"]
+            status=i["fields"]["status"]["name"]
+            print(f"{key}  |  {itype}  |  {status}")
+          PY
+
+      - name: Query PREC and add asset web links (enhanced JQL + type filter)
         run: |
           python - <<'PY'
           import os, sys, json, time, re
@@ -42,9 +63,11 @@ jobs:
           ASSETS_WORKSPACE_ID = os.environ["ASSETS_WORKSPACE_ID"]
           OBJECT_SCHEMA_ID    = os.environ["OBJECT_SCHEMA_ID"]
           JQL                 = os.environ["JQL"]
+          TYPE_REGEX          = os.environ.get("MISSION_RELEASE_TYPES", r"(?i)^mission\s*/\s*release$")
 
           AUTH = (JIRA_EMAIL, JIRA_API_TOKEN)
           H    = {"Accept":"application/json","Content-Type":"application/json"}
+          type_pat = re.compile(TYPE_REGEX)
 
           def die(msg, r=None):
               if r is not None:
@@ -54,7 +77,7 @@ jobs:
               sys.exit(1)
 
           # ---------- Enhanced JQL search with cursor pagination ----------
-          def search_issues_get(jql, next_token=None, fields=None, max_results=100):
+          def search_get(jql, next_token=None, fields=None, max_results=100):
               url = f"{JIRA_SITE}/rest/api/3/search/jql"
               params = {"jql": jql, "maxResults": max_results}
               if fields:
@@ -63,7 +86,7 @@ jobs:
                   params["nextPageToken"] = next_token
               return requests.get(url, headers=H, auth=AUTH, params=params)
 
-          def search_issues_post(jql, next_token=None, fields=None, max_results=100):
+          def search_post(jql, next_token=None, fields=None, max_results=100):
               url = f"{JIRA_SITE}/rest/api/3/search/jql"
               body = {"jql": jql, "maxResults": max_results}
               if fields:
@@ -75,9 +98,9 @@ jobs:
           def enhanced_search(jql, wanted_fields):
               next_token = None
               while True:
-                  r = search_issues_get(jql, next_token=next_token, fields=wanted_fields)
-                  if r.status_code in (404, 405, 410):
-                      r = search_issues_post(jql, next_token=next_token, fields=wanted_fields)
+                  r = search_get(jql, next_token=next_token, fields=wanted_fields)
+                  if r.status_code in (404,405,410):
+                      r = search_post(jql, next_token=next_token, fields=wanted_fields)
                   if r.status_code != 200:
                       die("Jira enhanced search failed", r)
                   page = r.json()
@@ -158,18 +181,29 @@ jobs:
           # ---------- Main ----------
           wanted_fields = ["summary","description","issuetype","project","status"]
           total_scanned = 0
+          matched_types = set()
 
           for issue in enhanced_search(JQL, wanted_fields):
               key    = issue["key"]
-              fields = issue.get("fields") or {}
-              proj   = fields.get("project", {}).get("key")
-              itype  = fields.get("issuetype", {}).get("name")
-              status = fields.get("status", {}).get("name")
+              f      = issue.get("fields") or {}
+              proj   = f.get("project", {}).get("key")
+              itype  = (f.get("issuetype", {}) or {}).get("name","")
+              status = (f.get("status", {}) or {}).get("name","")
 
-              if proj != "PREC" or itype not in ("Mission","Release") or status == "Validated (Complete)":
+              if proj != "PREC":
                   continue
 
-              desc = fields.get("description") or ""
+              # only Mission/Release types
+              if not type_pat.match(itype or ""):
+                  continue
+
+              # skip validated complete
+              if status == "Validated (Complete)":
+                  continue
+
+              matched_types.add(itype)
+
+              desc = f.get("description") or ""
               pairs = extract_pairs(desc if isinstance(desc, str) else get_issue_desc(key))
               if not pairs:
                   print(f"{key}: no asset tree detected; skipping")
@@ -196,5 +230,5 @@ jobs:
               total_scanned += 1
               time.sleep(0.2)
 
-          print(f"Done. Issues scanned: {total_scanned}")
+          print(f"Done. Issues scanned: {total_scanned}. Matched types seen: {sorted(matched_types)}")
           PY
