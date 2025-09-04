@@ -1,0 +1,151 @@
+name: Link JSM Assets to Work Item
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_key:
+        description: "Jira issue key (e.g., PREC-123)"
+        required: true
+        type: string
+      selections_json:
+        description: >
+          JSON array of { "category": "...", "name": "..." } to link.
+          Example:
+          [
+            {"category":"Displays","name":"11100411"},
+            {"category":"PCM Devices","name":"217646000000000"},
+            {"category":"DeweSoft Computers","name":"DB22020784"},
+            {"category":"CSS Loggers","name":"000005"}
+          ]
+        required: true
+        type: string
+
+jobs:
+  link-assets:
+    runs-on: ubuntu-latest
+    env:
+      # --- Jira/Auth/Workspace (store these in GitHub Secrets) ---
+      JIRA_SITE: ${{ secrets.JIRA_SITE }}            # e.g. https://yourcompany.atlassian.net
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      ASSETS_WORKSPACE_ID: ${{ secrets.ASSETS_WORKSPACE_ID }}
+      # --- Inputs ---
+      ISSUE_KEY: ${{ inputs.issue_key }}
+      SELECTIONS_JSON: ${{ inputs.selections_json }}
+
+    steps:
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Link assets & append tree
+        run: |
+          python - <<'PY'
+          import os, sys, json, requests
+
+          JIRA_SITE           = os.environ["JIRA_SITE"]
+          JIRA_EMAIL          = os.environ["JIRA_EMAIL"]
+          JIRA_API_TOKEN      = os.environ["JIRA_API_TOKEN"]
+          ASSETS_WORKSPACE_ID = os.environ["ASSETS_WORKSPACE_ID"]
+          ISSUE_KEY           = os.environ["ISSUE_KEY"]
+          SELECTIONS_JSON     = os.environ["SELECTIONS_JSON"]
+
+          try:
+              SELECTIONS = json.loads(SELECTIONS_JSON)
+              assert isinstance(SELECTIONS, list)
+          except Exception as e:
+              print("SELECTIONS_JSON must be a JSON array of {category,name} objects.", file=sys.stderr)
+              raise
+
+          AUTH = (JIRA_EMAIL, JIRA_API_TOKEN)
+          JSON_HEADERS = {"Accept":"application/json","Content-Type":"application/json"}
+
+          def die(msg, resp=None):
+              if resp is not None:
+                  print(f"{msg} ({resp.status_code}): {resp.text}", file=sys.stderr)
+              else:
+                  print(msg, file=sys.stderr)
+              sys.exit(1)
+
+          def assets_aql_search(category, name):
+              # Adjust attribute names if yours differ (e.g., "SN", "Serial")
+              aql = f'objectType = "{category}" AND (Name = "{name}" OR "Serial Number" = "{name}")'
+              url = f"{JIRA_SITE}/jsm/assets/workspace/{ASSETS_WORKSPACE_ID}/v1/object/aql"
+              payload = {"qlQuery": aql, "page": 1, "resultPerPage": 2}
+              r = requests.post(url, headers=JSON_HEADERS, auth=AUTH, data=json.dumps(payload))
+              if r.status_code != 200:
+                  die("Assets AQL search failed", r)
+              data = r.json() or {}
+              objs = data.get("objectEntries") or []
+              return objs[0] if objs else None
+
+          def build_asset_url(object_id):
+              # Copy an object URL from your site if this path differs
+              return f"{JIRA_SITE}/jira/servicedesk/assets/objects/{object_id}"
+
+          def create_remote_link(issue_key, link_url, title):
+              url = f"{JIRA_SITE}/rest/api/3/issue/{issue_key}/remotelink"
+              payload = {"object": {"title": title, "url": link_url}}
+              r = requests.post(url, headers=JSON_HEADERS, auth=AUTH, data=json.dumps(payload))
+              if r.status_code not in (200,201):
+                  die("Failed to create remote link", r)
+
+          def get_issue_description(issue_key):
+              url = f"{JIRA_SITE}/rest/api/3/issue/{issue_key}?fields=description"
+              r = requests.get(url, headers=JSON_HEADERS, auth=AUTH)
+              if r.status_code != 200:
+                  die("Failed to read issue", r)
+              fields = r.json().get("fields", {})
+              return fields.get("description") or ""
+
+          def set_issue_description(issue_key, new_text):
+              url = f"{JIRA_SITE}/rest/api/3/issue/{issue_key}"
+              payload = {"fields": {"description": new_text}}
+              r = requests.put(url, headers=JSON_HEADERS, auth=AUTH, data=json.dumps(payload))
+              if r.status_code != 204:
+                  die("Failed to update description", r)
+
+          def append_tree_section(original, items_by_category):
+              lines = ["", "## Assets", ""]
+              for cat, names in items_by_category.items():
+                  lines.append(f"- {cat}")
+                  for nm in names:
+                      lines.append(f"  - {nm}")
+              return (original or "") + "\n" + "\n".join(lines) + "\n"
+
+          items_by_cat = {}
+          for sel in SELECTIONS:
+              cat = sel.get("category","").strip()
+              nm  = sel.get("name","").strip()
+              if not cat or not nm:
+                  print(f"Skip malformed selection: {sel}")
+                  continue
+
+              obj = assets_aql_search(cat, nm)
+              if not obj:
+                  print(f"Skip: No asset found for {cat} / {nm}")
+                  continue
+
+              object_id = obj.get("id")
+              title = f"{cat} - {nm}"
+              url = build_asset_url(object_id)
+              create_remote_link(ISSUE_KEY, url, title)
+              items_by_cat.setdefault(cat, []).append(nm)
+              print(f"Linked: {title} -> {url}")
+
+          if items_by_cat:
+              current = get_issue_description(ISSUE_KEY)
+              updated = append_tree_section(current, items_by_cat)
+              set_issue_description(ISSUE_KEY, updated)
+              print("Description updated with Assets section.")
+          else:
+              print("No assets linked; description not changed.")
+          PY
+
